@@ -25,6 +25,7 @@
 #include <error/expected_utils.h>
 #include <aidl/android/media/audio/common/AudioStreamType.h>
 #include <android/binder_manager.h>
+#include <unistd.h>
 #include <com_android_media_audio.h>
 #include <media/AidlConversionCppNdk.h>
 #include <media/AidlConversionEffect.h>
@@ -400,7 +401,28 @@ void EffectsFactoryHalAidl::filterHalDescriptors(std::vector<Descriptor>& descs)
 // exports from a static library are optimized out unless actually used by
 // the shared library. See EffectsFactoryHalEntry.cpp.
 extern "C" void* createIEffectsFactoryImpl() {
-    return new effect::EffectsFactoryHalAidl(getServiceInstance<IFactory>("default"));
+    // NX809J: bounded, NON-blocking IFactory retrieval. Upstream getServiceInstance() loops
+    // forever on AServiceManager_waitForService; if the vendor audio HAL never registers
+    // android.hardware.audio.effect.IFactory/default (QTI audiohalservice.qti init is
+    // incomplete on this source-vendor port), audioserver hangs -> AudioService.<init>
+    // blocks system_server's main thread -> Watchdog kills it every 65s -> boot never
+    // completes. EffectsFactoryHalAidl tolerates a null factory (empty effect list), so give
+    // the HAL ~6s to appear, then fall back to no-effects so the device boots.
+    const std::string serviceName = std::string(IFactory::descriptor).append("/default");
+    std::shared_ptr<IFactory> factory;
+    for (int i = 0; i < 12 && factory == nullptr; ++i) {
+        AIBinder* b = AServiceManager_checkService(serviceName.c_str());
+        if (b != nullptr) {
+            factory = IFactory::fromBinder(ndk::SpAIBinder(b));
+            if (factory != nullptr) break;
+        }
+        usleep(500000);  // 0.5s
+    }
+    if (factory == nullptr) {
+        ALOGW("createIEffectsFactoryImpl: IFactory/default unavailable after wait; "
+              "booting with NO audio effects (NX809J fallback)");
+    }
+    return new effect::EffectsFactoryHalAidl(factory);
 }
 
 } // namespace android
