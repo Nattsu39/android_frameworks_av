@@ -3593,6 +3593,10 @@ void CameraProviderManager::filterLogicalCameraIdsLocked(
             continue;
         }
 
+        // combo contains the ids of a logical camera and its physical cameras
+        std::vector<std::string> combo = deviceInfo->mPhysicalIds;
+        combo.push_back(deviceId);
+
         hardware::CameraInfo info;
         int portraitRotation;
         status_t res = deviceInfo->getCameraInfo(CameraCompatibilityInfo(), &portraitRotation,
@@ -3600,24 +3604,6 @@ void CameraProviderManager::filterLogicalCameraIdsLocked(
         if (res != OK) {
             ALOGE("%s: Error reading camera info: %s (%d)", __FUNCTION__, strerror(-res), res);
             continue;
-        }
-
-        // Some vendor logical cameras include a public physical camera facing
-        // the other direction. Keep that camera visible to API1 clients rather
-        // than folding it into this logical camera's facing group.
-        std::vector<std::string> combo = {deviceId};
-        for (const auto& physicalId : deviceInfo->mPhysicalIds) {
-            auto physicalDeviceInfo = findDeviceInfoLocked(physicalId);
-            if (physicalDeviceInfo != nullptr) {
-                hardware::CameraInfo physicalInfo;
-                int physicalPortraitRotation;
-                status_t physicalRes = physicalDeviceInfo->getCameraInfo(
-                        CameraCompatibilityInfo(), &physicalPortraitRotation, &physicalInfo);
-                if (physicalRes == OK && physicalInfo.facing != info.facing) {
-                    continue;
-                }
-            }
-            combo.push_back(physicalId);
         }
         idCombos[info.facing].insert(combo.begin(), combo.end());
     }
