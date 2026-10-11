@@ -37,6 +37,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <hidl/HidlBinderSupport.h>
+#include <map>
 #include <utility>
 
 using namespace android;
@@ -116,6 +117,7 @@ struct TestICameraProvider : virtual public provider::V2_5::ICameraProvider {
     sp<provider::V2_4::ICameraProviderCallback> mCallbacks;
     std::vector<hardware::hidl_string> mDeviceNames;
     sp<device::V3_2::ICameraDevice> mDeviceInterface;
+    std::map<std::string, sp<device::V3_2::ICameraDevice>> mDeviceInterfaces;
     hardware::hidl_vec<common::V1_0::VendorTagSection> mVendorTagSections;
 
     // Whether to call a physical camera unavailable callback upon setCallback
@@ -211,9 +213,11 @@ struct TestICameraProvider : virtual public provider::V2_5::ICameraProvider {
     using getCameraDeviceInterface_V3_x_cb = std::function<void(Status status,
             const sp<device::V3_2::ICameraDevice>& device)>;
     virtual hardware::Return<void> getCameraDeviceInterface_V3_x(
-            const hardware::hidl_string&,
+            const hardware::hidl_string& cameraDeviceName,
             getCameraDeviceInterface_V3_x_cb _hidl_cb) override {
-        _hidl_cb(Status::OK, mDeviceInterface);
+        auto device = mDeviceInterfaces.find(cameraDeviceName.c_str());
+        _hidl_cb(Status::OK, device == mDeviceInterfaces.end()
+                ? mDeviceInterface : device->second);
         return hardware::Void();
     }
 
@@ -480,6 +484,67 @@ struct TestStatusListener : public CameraProviderManager::StatusListener {
             TorchModeStatus, SystemCameraKind) override {}
     void onNewProviderRegistered() override {}
 };
+
+// Model a vendor logical rear camera that may also list a standalone front
+// camera among its physical IDs. The legacy API must retain both facing directions.
+static sp<TestICameraProvider> createLogicalCameraProvider(bool includeFrontCamera) {
+    std::vector<hardware::hidl_string> deviceNames = {
+        "device@3.2/test/0", "device@3.2/test/1",
+        "device@3.2/test/2", "device@3.2/test/3",
+    };
+    hardware::hidl_vec<common::V1_0::VendorTagSection> vendorTags;
+    sp<TestICameraProvider> provider = new TestICameraProvider(deviceNames, vendorTags);
+
+    for (size_t index = 0; index < deviceNames.size(); index++) {
+        CameraMetadata metadata;
+        uint8_t facing = index == 3 ? ANDROID_LENS_FACING_FRONT : ANDROID_LENS_FACING_BACK;
+        int32_t orientation = index == 3 ? 270 : 90;
+        std::vector<uint8_t> capabilities = {
+            ANDROID_REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE,
+        };
+        if (index == 0) {
+            capabilities.push_back(ANDROID_REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA);
+            const uint8_t physicalIds[] = {'1', '\0', '2', '\0', '3', '\0'};
+            EXPECT_EQ(OK, metadata.update(ANDROID_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS,
+                    physicalIds, includeFrontCamera ? sizeof(physicalIds) : 4));
+        }
+        EXPECT_EQ(OK, metadata.update(ANDROID_LENS_FACING, &facing, 1));
+        EXPECT_EQ(OK, metadata.update(ANDROID_SENSOR_ORIENTATION, &orientation, 1));
+        EXPECT_EQ(OK, metadata.update(ANDROID_REQUEST_AVAILABLE_CAPABILITIES,
+                capabilities.data(), capabilities.size()));
+        const camera_metadata_t* buffer = metadata.getAndLock();
+        hardware::hidl_vec<uint8_t> characteristics;
+        characteristics.setToExternal(
+                reinterpret_cast<uint8_t*>(const_cast<camera_metadata_t*>(buffer)),
+                get_camera_metadata_size(buffer));
+        provider->mDeviceInterfaces.emplace(deviceNames[index].c_str(),
+                new TestDeviceInterface(deviceNames, characteristics));
+        metadata.unlock(buffer);
+    }
+    return provider;
+}
+
+TEST(CameraProviderManagerTest, Api1PreservesFrontCameraInRearLogicalGroup) {
+    sp<CameraProviderManager> manager = new CameraProviderManager();
+    sp<TestStatusListener> listener = new TestStatusListener();
+    TestHidlInteractionProxy proxy;
+    TestAidlInteractionProxy aidlProxy;
+    proxy.setProvider(createLogicalCameraProvider(true));
+
+    ASSERT_EQ(OK, manager->initialize(listener, &proxy, &aidlProxy));
+    EXPECT_THAT(manager->getAPI1CompatibleCameraDeviceIds(), ElementsAre("0", "3"));
+}
+
+TEST(CameraProviderManagerTest, Api1StillFiltersSameFacingPhysicalCameras) {
+    sp<CameraProviderManager> manager = new CameraProviderManager();
+    sp<TestStatusListener> listener = new TestStatusListener();
+    TestHidlInteractionProxy proxy;
+    TestAidlInteractionProxy aidlProxy;
+    proxy.setProvider(createLogicalCameraProvider(false));
+
+    ASSERT_EQ(OK, manager->initialize(listener, &proxy, &aidlProxy));
+    EXPECT_THAT(manager->getAPI1CompatibleCameraDeviceIds(), ElementsAre("0", "3"));
+}
 
 TEST(CameraProviderManagerTest, InitializeDynamicDepthTest) {
     std::vector<hardware::hidl_string> deviceNames;
